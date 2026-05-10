@@ -1,0 +1,12 @@
+{
+  "intervalMinutes": 10,
+  "server": "FREYA",
+  "storeType": "BUY",
+  "topN": 5,
+  "items": [
+    "Blacksmith Blessing",
+    "HD Elunium",
+    "Bloody Branch",
+    "HD Oridecon"
+  ]
+}

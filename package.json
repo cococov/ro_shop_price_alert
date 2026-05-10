@@ -1,0 +1,17 @@
+{
+  "name": "ro-shop-price-alert",
+  "version": "1.0.0",
+  "description": "CLI tool to monitor Ragnarok Online shop prices",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": ["ragnarok-online", "price-tracker", "shop-monitor"],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "packageManager": "pnpm@10.11.0"
+}
