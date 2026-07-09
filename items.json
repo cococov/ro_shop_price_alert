@@ -1,5 +1,5 @@
 {
-  "intervalMinutes": 10,
+  "intervalMinutes": 5,
   "server": "FREYA",
   "storeType": "BUY",
   "topN": 5,
