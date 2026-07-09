@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { createInterface } from 'readline';
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -12,6 +12,8 @@ const MAX_TOP_N = 50;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_RETRIES = 2;
 const MAX_ITEMS = 30;
+const MAX_HISTORY_POINTS = 500;
+const DEFAULT_HISTORY_FILE = 'price-history.json';
 
 const DELAY = {
   betweenPages: { min: 2000, max: 4000 },
@@ -65,6 +67,8 @@ function parseArgs() {
         process.exit(1);
       }
       parsed.topN = val;
+    } else if (args[i] === '--history-file' && args[i + 1]) {
+      parsed.historyFile = args[++i];
     } else if (args[i] === '--help' || args[i] === '-h') {
       console.log(`${C.bold}${C.cyan}RO Shop Price Alert${C.reset}
 Monitors Ragnarok Online shop listings and shows the cheapest prices.
@@ -75,6 +79,7 @@ ${C.bold}Usage:${C.reset}
 ${C.bold}Options:${C.reset}
   --interval <min>    Polling interval in minutes (min: ${MIN_INTERVAL_MINUTES}, default: 15)
   --items-file <path> Path to items config file (default: ./items.json)
+  --history-file <path> Path to price history file (default: ./${DEFAULT_HISTORY_FILE})
   --top <n>           Number of cheapest shops to show (1-${MAX_TOP_N}, default: ${DEFAULT_TOP_N})
   -h, --help          Show this help
 
@@ -85,6 +90,7 @@ ${C.bold}Interactive commands (Tab completion available):${C.reset}
   /change-top <n>          Change number of top results
   /list                    Show current config and tracked items
   /check                   Run a price check immediately
+  /history <item> [scope] [mode] Show history graph; scope: max, day, session; mode: line, whisker
   /clear                   Clear the screen
   /help                    Show available commands
   /quit                    Exit the program
@@ -125,6 +131,58 @@ function truncPad(str, len) {
 /** Format a number as Ragnarok zeny (e.g., "1,200,000z"). */
 function formatZeny(n) {
   return n.toLocaleString('en-US') + 'z';
+}
+
+function formatShortZeny(n) {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1).replace(/\.0$/, '')}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  return String(n);
+}
+
+function percentile(sortedNumbers, p) {
+  if (sortedNumbers.length === 0) return null;
+  if (sortedNumbers.length === 1) return sortedNumbers[0];
+  const idx = (sortedNumbers.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sortedNumbers[lo];
+  return sortedNumbers[lo] + (sortedNumbers[hi] - sortedNumbers[lo]) * (idx - lo);
+}
+
+function calculatePriceStats(prices) {
+  const sorted = [...prices].sort((a, b) => a - b);
+  return {
+    min: Math.round(percentile(sorted, 0)),
+    q1: Math.round(percentile(sorted, 0.25)),
+    median: Math.round(percentile(sorted, 0.5)),
+    q3: Math.round(percentile(sorted, 0.75)),
+    max: Math.round(percentile(sorted, 1)),
+    avg: Math.round(sorted.reduce((a, b) => a + b, 0) / sorted.length),
+  };
+}
+
+function normalizeKey(value) {
+  return value.trim().toLowerCase();
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function formatHistoryTime(timestamp) {
+  return new Date(timestamp).toLocaleString('en-GB', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function getHistoryScopeLabel(scope) {
+  if (scope === 'day') return 'last 24h';
+  if (scope === 'session') return 'session';
+  return 'max';
 }
 
 // ── Spinner ──────────────────────────────────────────────────────────
@@ -225,6 +283,45 @@ function saveConfig(filePath, config) {
     items: config.items,
   };
   writeFileSync(filePath, JSON.stringify(data, null, 2) + '\n');
+}
+
+// ── Price History ───────────────────────────────────────────────────
+
+function loadHistory(filePath) {
+  if (!existsSync(filePath)) return { version: 1, items: {} };
+
+  try {
+    const raw = JSON.parse(readFileSync(filePath, 'utf-8'));
+    if (raw?.items && typeof raw.items === 'object') return raw;
+  } catch (err) {
+    throw new Error(`Could not read history: ${err.message}`);
+  }
+
+  throw new Error('History file must be a JSON object with an "items" object');
+}
+
+function saveHistory(filePath, history) {
+  writeFileSync(filePath, JSON.stringify(history, null, 2) + '\n');
+}
+
+function recordHistoryEntry(filePath, entry) {
+  const history = loadHistory(filePath);
+  const key = normalizeKey(entry.itemName);
+  const current = history.items[key] ?? { itemName: entry.itemName, checks: [] };
+
+  current.itemName = entry.itemName;
+  current.checks.push(entry);
+  if (current.checks.length > MAX_HISTORY_POINTS) {
+    current.checks = current.checks.slice(-MAX_HISTORY_POINTS);
+  }
+
+  history.items[key] = current;
+  saveHistory(filePath, history);
+}
+
+function getHistoryEntries(filePath, itemName) {
+  const history = loadHistory(filePath);
+  return history.items[normalizeKey(itemName)]?.checks ?? [];
 }
 
 // ── API Client ───────────────────────────────────────────────────────
@@ -518,10 +615,101 @@ function printItemFooter(min, max, avg) {
   console.log(`  ${C.cyan}\u2514${'\u2500'.repeat(INNER)}\u2518${C.reset}`);
 }
 
+function sparkline(values, minValue, maxValue) {
+  const bars = '▁▂▃▄▅▆▇█';
+  if (values.length === 0) return '';
+  if (minValue === maxValue) return bars[Math.floor(bars.length / 2)].repeat(values.length);
+  return values.map((value) => {
+    const pos = Math.round(((value - minValue) / (maxValue - minValue)) * (bars.length - 1));
+    return bars[clamp(pos, 0, bars.length - 1)];
+  }).join('');
+}
+
+function printHistoryLineGraph(itemName, entries, scope) {
+  const recent = entries;
+  const fields = [
+    ['min', 'Min', C.green],
+    ['q1', 'Q1', C.cyan],
+    ['median', 'Median', C.yellow],
+    ['q3', 'Q3', C.magenta],
+    ['max', 'Max', C.red],
+  ];
+  const allValues = recent.flatMap((entry) => fields.map(([key]) => entry.stats[key]));
+  const minValue = Math.min(...allValues);
+  const maxValue = Math.max(...allValues);
+
+  console.log('');
+  console.log(`  ${C.bold}${C.cyan}History: ${itemName}${C.reset} ${C.dim}(line, ${getHistoryScopeLabel(scope)}, ${recent.length} point(s))${C.reset}`);
+  console.log(`  ${C.dim}${formatHistoryTime(recent[0].timestamp)} -> ${formatHistoryTime(recent[recent.length - 1].timestamp)} | scale ${formatShortZeny(minValue)} - ${formatShortZeny(maxValue)} zeny${C.reset}`);
+  console.log(`  ${C.dim}${'─'.repeat(86)}${C.reset}`);
+
+  for (const [key, label, color] of fields) {
+    const values = recent.map((entry) => entry.stats[key]);
+    const latest = values[values.length - 1];
+    console.log(`  ${color}${label.padEnd(7)}${C.reset} ${sparkline(values, minValue, maxValue)} ${C.dim}${formatZeny(latest)}${C.reset}`);
+  }
+  console.log('');
+}
+
+function printHistoryWhiskerGraph(itemName, entries, scope) {
+  const recent = entries;
+  const width = 48;
+  const allValues = recent.flatMap((entry) => [
+    entry.stats.min,
+    entry.stats.q1,
+    entry.stats.median,
+    entry.stats.q3,
+    entry.stats.max,
+  ]);
+  const minValue = Math.min(...allValues);
+  const maxValue = Math.max(...allValues);
+  const scale = (value) => {
+    if (minValue === maxValue) return Math.floor(width / 2);
+    return clamp(Math.round(((value - minValue) / (maxValue - minValue)) * (width - 1)), 0, width - 1);
+  };
+
+  console.log('');
+  console.log(`  ${C.bold}${C.cyan}History: ${itemName}${C.reset} ${C.dim}(whisker, ${getHistoryScopeLabel(scope)}, ${recent.length} point(s))${C.reset}`);
+  console.log(`  ${C.dim}scale ${formatShortZeny(minValue)} - ${formatShortZeny(maxValue)} zeny${C.reset}`);
+  console.log(`  ${C.dim}${'─'.repeat(86)}${C.reset}`);
+
+  for (const entry of recent) {
+    const chars = Array(width).fill(' ');
+    const minPos = scale(entry.stats.min);
+    const q1Pos = scale(entry.stats.q1);
+    const medianPos = scale(entry.stats.median);
+    const q3Pos = scale(entry.stats.q3);
+    const maxPos = scale(entry.stats.max);
+
+    for (let i = minPos; i <= maxPos; i++) chars[i] = '─';
+    for (let i = q1Pos; i <= q3Pos; i++) chars[i] = '═';
+    chars[minPos] = '┬';
+    chars[q1Pos] = '[';
+    chars[medianPos] = '│';
+    chars[q3Pos] = ']';
+    chars[maxPos] = '┬';
+
+    console.log(`  ${C.dim}${formatHistoryTime(entry.timestamp)}${C.reset} ${C.cyan}${chars.join('')}${C.reset} ${C.green}${formatShortZeny(entry.stats.min)}${C.reset}/${C.yellow}${formatShortZeny(entry.stats.median)}${C.reset}/${C.red}${formatShortZeny(entry.stats.max)}${C.reset}`);
+  }
+  console.log('');
+}
+
+function printHistoryGraph(itemName, entries, mode, scope) {
+  if (entries.length === 0) {
+    console.log(`  ${C.yellow}No history for "${itemName}" in scope "${scope}". Run /check first or try max.${C.reset}`);
+    return;
+  }
+  if (mode === 'whisker') {
+    printHistoryWhiskerGraph(itemName, entries, scope);
+    return;
+  }
+  printHistoryLineGraph(itemName, entries, scope);
+}
+
 // ── Item Check ───────────────────────────────────────────────────────
 
 /** Fetch and display the top cheapest shops for a single item. */
-async function checkItem(itemName, storeType, serverType, topN) {
+async function checkItem(itemName, storeType, serverType, topN, historyPath, timestamp) {
   const spin = createSpinner(`Fetching ${C.bold}${itemName}${C.reset}...`);
 
   try {
@@ -544,9 +732,28 @@ async function checkItem(itemName, storeType, serverType, topN) {
     const sorted = [...data.list].sort((a, b) => a.itemPrice - b.itemPrice);
     const top = sorted.slice(0, topN);
     const allPrices = data.list.map((i) => i.itemPrice);
-    const min = allPrices.reduce((a, b) => Math.min(a, b), Infinity);
-    const max = allPrices.reduce((a, b) => Math.max(a, b), -Infinity);
-    const avg = Math.round(allPrices.reduce((a, b) => a + b, 0) / allPrices.length);
+    const stats = calculatePriceStats(allPrices);
+
+    try {
+      recordHistoryEntry(historyPath, {
+        timestamp,
+        itemName,
+        server: serverType,
+        storeType,
+        totalCount: data.totalCount,
+        listingCount: data.list.length,
+        stats: {
+          min: stats.min,
+          q1: stats.q1,
+          median: stats.median,
+          q3: stats.q3,
+          max: stats.max,
+          avg: stats.avg,
+        },
+      });
+    } catch (err) {
+      console.error(`  ${C.yellow}Could not save history for "${itemName}": ${err.message}${C.reset}`);
+    }
 
     // Fetch locations sequentially with delays
     const details = [];
@@ -573,7 +780,7 @@ async function checkItem(itemName, storeType, serverType, topN) {
       printItemRow(i, top[i], navi);
     }
 
-    printItemFooter(min, max, avg);
+    printItemFooter(stats.min, stats.max, stats.avg);
     console.log('');
   } catch (err) {
     spin.stop();
@@ -625,6 +832,12 @@ const COMMANDS = {
     usage: '/check',
     desc: 'Run a price check immediately',
     group: 'Actions',
+  },
+  '/history': {
+    usage: '/history <item> [max|day|session] [line|whisker]',
+    desc: 'Show saved price movement graph',
+    group: 'Actions',
+    aliases: ['/graph'],
   },
   '/clear': {
     usage: '/clear',
@@ -712,6 +925,41 @@ function getTimeRemaining(app) {
   const sec = Math.floor((diff % 60_000) / 1000);
   if (min > 0) return `${min}m ${sec}s`;
   return `${sec}s`;
+}
+
+function filterHistoryEntries(entries, scope, app) {
+  if (scope === 'max') return entries;
+
+  const since = scope === 'session'
+    ? app.sessionStartedAt
+    : Date.now() - 24 * 60 * 60_000;
+
+  return entries.filter((entry) => new Date(entry.timestamp).getTime() >= since);
+}
+
+function parseHistoryArg(arg) {
+  const parts = arg.split(/\s+/).filter(Boolean);
+  let mode = 'line';
+  let scope = 'max';
+
+  while (parts.length > 0) {
+    const last = parts[parts.length - 1].toLowerCase();
+    if (['line', 'whisker'].includes(last)) {
+      mode = parts.pop().toLowerCase();
+      continue;
+    }
+    if (['max', 'day', 'session'].includes(last)) {
+      scope = parts.pop().toLowerCase();
+      continue;
+    }
+    break;
+  }
+
+  return {
+    itemName: parts.join(' '),
+    mode,
+    scope,
+  };
 }
 
 /**
@@ -832,6 +1080,21 @@ async function handleCommand(input, app) {
       return true;
     }
 
+    case '/history': {
+      const { itemName, mode, scope } = parseHistoryArg(arg);
+      if (!itemName) {
+        console.log(`  ${C.red}Usage: /history <item> [max|day|session] [line|whisker]${C.reset}`);
+        return true;
+      }
+      try {
+        const entries = filterHistoryEntries(getHistoryEntries(app.historyPath, itemName), scope, app);
+        printHistoryGraph(itemName, entries, mode, scope);
+      } catch (err) {
+        console.log(`  ${C.red}Could not read history: ${err.message}${C.reset}`);
+      }
+      return true;
+    }
+
     default: {
       if (cmd.startsWith('/')) {
         console.log(`  ${C.red}Unknown command: ${cmd}${C.reset}  ${C.dim}Type /help for available commands.${C.reset}`);
@@ -850,7 +1113,8 @@ async function runCheckCycle(app) {
   app.checking = true;
   app.rl.pause();
 
-  const ts = new Date().toLocaleTimeString('en-GB');
+  const checkTimestamp = new Date().toISOString();
+  const ts = new Date(checkTimestamp).toLocaleTimeString('en-GB');
   console.log(`\n${C.dim}[ ${ts} ] Running check...${C.reset}\n`);
 
   let aborted = false;
@@ -863,7 +1127,14 @@ async function runCheckCycle(app) {
 
     for (let i = 0; i < itemsSnapshot.length; i++) {
       try {
-        await checkItem(itemsSnapshot[i], app.config.storeType, app.config.server, app.config.topN);
+        await checkItem(
+          itemsSnapshot[i],
+          app.config.storeType,
+          app.config.server,
+          app.config.topN,
+          app.historyPath,
+          checkTimestamp
+        );
       } catch (err) {
         if (err.message === 'RATE_LIMITED' || err.message === 'BLOCKED') {
           aborted = true;
@@ -932,6 +1203,7 @@ function rescheduleCheck(app) {
 async function main() {
   const cliArgs = parseArgs();
   const configPath = cliArgs.itemsFile || new URL('./items.json', import.meta.url);
+  const historyPath = cliArgs.historyFile || new URL(`./${DEFAULT_HISTORY_FILE}`, import.meta.url);
 
   let config;
   try {
@@ -979,10 +1251,12 @@ async function main() {
   const app = {
     config,
     configPath,
+    historyPath,
     rl,
     timerId: null,
     nextCheckAt: null,
     lastCheckAt: null,
+    sessionStartedAt: Date.now(),
     checking: false,
     consecutiveFailures: 0,
     quitting: false,
