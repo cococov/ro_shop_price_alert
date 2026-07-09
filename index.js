@@ -21,6 +21,10 @@ const DELAY = {
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+const SHOP_TRADING_URL = 'https://ro.gnjoylatam.com/en/intro/shop-search/trading';
+const SHOP_DETAIL_ACTION_FALLBACK = '404ed8774f606f8b1eb689aac3cb179d34321adc53';
+
+let cachedShopDetailAction = null;
 
 // ── ANSI Colors & Styles ────────────────────────────────────────────
 
@@ -312,15 +316,14 @@ async function safeFetch(url, options = {}, { maxRetries = MAX_RETRIES, label = 
  */
 async function fetchShopPage({ searchWord, storeType, serverType, page = 1 }) {
   const encodedSearch = encodeURIComponent(searchWord);
-  const baseUrl = 'https://ro.gnjoylatam.com/en/intro/shop-search/trading';
-  const url = `${baseUrl}?storeType=${storeType}&serverType=${serverType}&searchWord=${encodedSearch}&p=${page}`;
+  const url = `${SHOP_TRADING_URL}?storeType=${storeType}&serverType=${serverType}&searchWord=${encodedSearch}&p=${page}`;
 
   const res = await safeFetch(url, {
     headers: {
       'accept': '*/*',
       'next-url': '/en/intro/shop-search/trading',
       'rsc': '1',
-      'Referer': `${baseUrl}?storeType=${storeType}&serverType=${serverType}&searchWord=${encodedSearch}`,
+      'Referer': `${SHOP_TRADING_URL}?storeType=${storeType}&serverType=${serverType}&searchWord=${encodedSearch}`,
     },
   }, { label: `page ${page}` });
 
@@ -331,23 +334,84 @@ async function fetchShopPage({ searchWord, storeType, serverType, page = 1 }) {
   });
 }
 
+async function resolveShopDetailAction({ storeType, serverType }) {
+  if (cachedShopDetailAction) return cachedShopDetailAction;
+
+  try {
+    const pageUrl = `${SHOP_TRADING_URL}?storeType=${storeType}&serverType=${serverType}&searchWord=&p=1`;
+    const res = await safeFetch(pageUrl, {
+      headers: {
+        'accept': '*/*',
+        'next-url': '/en/intro/shop-search/trading',
+        'rsc': '1',
+        'Referer': pageUrl,
+      },
+    }, { label: 'shop detail action discovery', maxRetries: 0 });
+    const text = await res.text();
+    const chunkPaths = [...new Set(
+      [...text.matchAll(/static\/chunks\/[^"\\]+?\.js/g)].map((match) => match[0])
+    )];
+
+    for (const path of chunkPaths) {
+      const chunkUrl = new URL(`/_next/${path}`, SHOP_TRADING_URL).href;
+      const chunkRes = await safeFetch(chunkUrl, {
+        headers: {
+          'accept': 'application/javascript,*/*;q=0.8',
+          'Referer': pageUrl,
+        },
+      }, { label: 'shop detail action chunk', maxRetries: 0 });
+      const chunk = await chunkRes.text();
+      const match = chunk.match(/createServerReference\("([a-f0-9]{40,})"[\s\S]{0,300}?"getDetail"/);
+      if (match) {
+        cachedShopDetailAction = match[1];
+        return cachedShopDetailAction;
+      }
+    }
+  } catch {
+    // Fall back to the latest known action id below.
+  }
+
+  cachedShopDetailAction = SHOP_DETAIL_ACTION_FALLBACK;
+  return cachedShopDetailAction;
+}
+
 /**
  * Fetch shop location details (map, coordinates).
- * Uses a Next.js server action identified by a hardcoded hash.
- * NOTE: The `next-action` hash may change on site redeployment. If all
- *       location lookups start returning null, this hash needs updating.
+ * Uses the current Next.js server action id, discovered from the page chunks.
  */
 async function fetchShopDetails({ svrId, mapId, ssi, storeType, serverType }) {
-  const url = `https://ro.gnjoylatam.com/en/intro/shop-search/trading?storeType=${storeType}&serverType=${serverType}&searchWord=&p=1&limit=40`;
+  const params = { svrId, mapId, ssi };
+  const firstAction = cachedShopDetailAction ?? SHOP_DETAIL_ACTION_FALLBACK;
+  const firstDetails = await fetchShopDetailsWithAction({
+    action: firstAction,
+    params,
+    storeType,
+    serverType,
+  });
+  if (firstDetails || cachedShopDetailAction) return firstDetails;
+
+  const discoveredAction = await resolveShopDetailAction({ storeType, serverType });
+  if (discoveredAction === firstAction) return firstDetails;
+
+  return fetchShopDetailsWithAction({
+    action: discoveredAction,
+    params,
+    storeType,
+    serverType,
+  });
+}
+
+async function fetchShopDetailsWithAction({ action, params, storeType, serverType }) {
+  const url = `${SHOP_TRADING_URL}?storeType=${storeType}&serverType=${serverType}&searchWord=&p=1&limit=40`;
 
   const res = await safeFetch(url, {
     method: 'POST',
     headers: {
       'accept': 'text/x-component',
       'content-type': 'text/plain;charset=UTF-8',
-      'next-action': '40761b420b473bb3383fdbd90f3707e286226348b5',
+      'next-action': action,
     },
-    body: JSON.stringify([{ type: 'store', params: { svrId, mapId, ssi } }]),
+    body: JSON.stringify([{ type: 'store', params }]),
   }, { label: 'shop details' });
 
   const text = await res.text();
