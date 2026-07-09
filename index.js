@@ -5,7 +5,7 @@ import { createInterface } from 'readline';
 
 const ITEMS_PER_PAGE = 60;
 const MAX_PAGES = 20;
-const MIN_INTERVAL_MINUTES = 10;
+const MIN_INTERVAL_MINUTES = 5;
 const DEFAULT_INTERVAL_MINUTES = 15;
 const DEFAULT_TOP_N = 5;
 const MAX_TOP_N = 50;
